@@ -1,0 +1,13 @@
+{
+  "name": "night-market-clustered-lights",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Dense-light clustered forward renderer with an interactive night-market light editor and overflow-safe publishing.",
+  "scripts": {
+    "start": "node serve.mjs",
+    "serve": "node serve.mjs",
+    "verify": "node scripts/verify.mjs",
+    "shot": "node scripts/shot.mjs"
+  }
+}
