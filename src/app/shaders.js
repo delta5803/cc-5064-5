@@ -47,6 +47,9 @@ uniform int   uIndexWidth;
 uniform uint  uGlobalOffset;
 uniform uint  uGlobalCount;
 uniform int   uDebugMode; // 0 lit,1 occupancy heat,2 slice bands,3 cluster hash,4 linear depth
+// Depth boundary table, identical to cfg.boundaries in clusters.js. Fixed scheme
+// = exponential values; adaptive scheme = visible-depth quantiles. Same shader.
+uniform float uBoundaries[41];
 
 uniform highp usampler2D uHeaderTex;
 uniform highp usampler2D uIndexTex;
@@ -62,8 +65,16 @@ float viewDepthFromDepth01(float d01){
 int sliceForViewDepth(float d){
   if (!(d > uNear)) return 0;
   if (d >= uFar) return uSlices - 1;
-  float t = (log(d / uNear) / log(uFar / uNear)) * float(uSlices);
-  return clamp(int(floor(t)), 0, uSlices - 1);
+  // Binary search the (strictly increasing) boundary table.
+  int lo = 0;
+  int hi = uSlices;
+  for (int it = 0; it < 8; it++) {
+    if (lo >= hi) break;
+    int mid = (lo + hi) >> 1;
+    if (uBoundaries[mid + 1] <= d) lo = mid + 1;
+    else hi = mid;
+  }
+  return clamp(lo, 0, uSlices - 1);
 }
 
 vec3 aces(vec3 x){

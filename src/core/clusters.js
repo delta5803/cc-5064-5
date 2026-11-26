@@ -14,16 +14,41 @@
 
 import { clamp } from './math.js';
 
+// Upper bound of depth slices supported by the shader's uniform boundary table.
+export const MAX_SLICES = 40;
+
+// The fixed partition: exponentially spaced boundaries, boundary(0)=near,
+// boundary(slices)=far. This is the original scheme and the default table.
+export function exponentialBoundaries(near, far, slices) {
+  const b = new Float32Array(slices + 1);
+  for (let k = 0; k <= slices; k++) b[k] = near * Math.pow(far / near, k / slices);
+  b[0] = near;
+  b[slices] = far;
+  return b;
+}
+
 export function makeClusterConfig(opts = {}) {
   const width = opts.width ?? 1280;
   const height = opts.height ?? 720;
   const tilePixels = opts.tilePixels ?? 80;
-  const slices = opts.slices ?? 24;
+  const slices = clamp(Math.round(opts.slices ?? 24), 1, MAX_SLICES);
   const near = opts.near ?? 0.1;
   const far = opts.far ?? 140;
   const fovyDeg = opts.fovyDeg ?? 60;
   const cols = Math.max(1, Math.ceil(width / tilePixels));
   const rows = Math.max(1, Math.ceil(height / tilePixels));
+  const partition = opts.partition === 'adaptive' ? 'adaptive' : 'fixed';
+  let boundaries;
+  if (opts.boundaries) {
+    if (opts.boundaries.length !== slices + 1) {
+      throw new Error(`boundaries length ${opts.boundaries.length} != slices+1 (${slices + 1})`);
+    }
+    boundaries = Float32Array.from(opts.boundaries);
+    boundaries[0] = near;
+    boundaries[slices] = far;
+  } else {
+    boundaries = exponentialBoundaries(near, far, slices);
+  }
   return {
     width,
     height,
@@ -37,12 +62,18 @@ export function makeClusterConfig(opts = {}) {
     cols,
     rows,
     clusterCount: cols * rows * slices,
+    partition,
+    // Depth boundary table shared by the CPU kernel AND the shader. The fixed
+    // scheme fills this with exponential values; the adaptive scheme fills it
+    // with visible-depth quantiles. Everything downstream consumes this table,
+    // so both schemes run through the SAME shader path.
+    boundaries,
   };
 }
 
-// Exponential depth boundary for slice k (k = 0..slices).
-// boundary(0)=near, boundary(slices)=far.
+// Depth boundary for slice k (k = 0..slices) from the active table.
 export function depthBoundary(cfg, k) {
+  if (cfg.boundaries) return cfg.boundaries[clamp(k | 0, 0, cfg.slices)];
   return cfg.near * Math.pow(cfg.far / cfg.near, k / cfg.slices);
 }
 
@@ -67,13 +98,26 @@ export function viewDepthToDepth01(cfg, d) {
   return zNdc * 0.5 + 0.5;
 }
 
-// Map a positive view depth to an exponential slice index, clamped conservatively.
+// Map a positive view depth to a slice index using the active boundary table.
 // Depths closer than near go to slice 0; depths at/beyond far go to the last slice.
+// Binary search keeps adaptive (non-uniform) tables correct and cheap.
 export function sliceForViewDepth(cfg, d) {
   if (!(d > cfg.near)) return 0; // also handles d <= 0 / NaN defensively
   if (d >= cfg.far) return cfg.slices - 1;
-  const t = (Math.log(d / cfg.near) / Math.log(cfg.far / cfg.near)) * cfg.slices;
-  return clamp(Math.floor(t), 0, cfg.slices - 1);
+  const b = cfg.boundaries;
+  if (!b) {
+    const t = (Math.log(d / cfg.near) / Math.log(cfg.far / cfg.near)) * cfg.slices;
+    return clamp(Math.floor(t), 0, cfg.slices - 1);
+  }
+  // Find the last boundary <= d: boundaries are strictly increasing.
+  let lo = 0;
+  let hi = cfg.slices;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (b[mid + 1] <= d) lo = mid + 1;
+    else hi = mid;
+  }
+  return clamp(lo, 0, cfg.slices - 1);
 }
 
 // WRONG on purpose reference: indexing slices with the non-linear depth value.

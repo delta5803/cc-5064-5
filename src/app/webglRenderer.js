@@ -139,6 +139,7 @@ export class WebGLClusteredRenderer {
         tile: this._u(this.sceneProg, 'uTile'), indexWidth: this._u(this.sceneProg, 'uIndexWidth'),
         globalOffset: this._u(this.sceneProg, 'uGlobalOffset'), globalCount: this._u(this.sceneProg, 'uGlobalCount'),
         debugMode: this._u(this.sceneProg, 'uDebugMode'),
+        boundaries: this._u(this.sceneProg, 'uBoundaries'),
         headerTex: this._u(this.sceneProg, 'uHeaderTex'), indexTex: this._u(this.sceneProg, 'uIndexTex'), lightTex: this._u(this.sceneProg, 'uLightTex'),
       },
       bulb: {
@@ -212,6 +213,12 @@ export class WebGLClusteredRenderer {
     gl.uniform1ui(U.globalOffset, frame.globalOffset);
     gl.uniform1ui(U.globalCount, frame.globalSlots.length);
     gl.uniform1i(U.debugMode, debugMode | 0);
+    // Upload the depth boundary table (same values the CPU kernel used to assign
+    // lights into this frame). Fixed and adaptive partitions both arrive here.
+    if (!this.boundaryScratch) this.boundaryScratch = new Float32Array(41);
+    this.boundaryScratch.fill(0);
+    this.boundaryScratch.set(cfg.boundaries);
+    gl.uniform1fv(U.boundaries, this.boundaryScratch);
 
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.headerTex); gl.uniform1i(U.headerTex, 0);
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.indexTex); gl.uniform1i(U.indexTex, 1);

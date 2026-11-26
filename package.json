@@ -8,6 +8,7 @@
     "start": "node serve.mjs",
     "serve": "node serve.mjs",
     "verify": "node scripts/verify.mjs",
+    "experiment": "node scripts/experiment.mjs",
     "shot": "node scripts/shot.mjs"
   }
 }

@@ -103,6 +103,8 @@ label.check input { accent-color: var(--accent); }
 .compare-canvases canvas { width: 100%; aspect-ratio: 16/9; background: #05070f; border: 1px solid var(--line); border-radius: 8px; image-rendering: auto; }
 .compare-canvases figcaption { font-size: 11.5px; color: var(--muted); margin-top: 4px; text-align: center; }
 .metrics { font-family: var(--mono); font-size: 11.5px; color: #b9c7f2; background: #0d1326; border: 1px solid var(--line); border-radius: 8px; padding: 10px; white-space: pre-wrap; }
+.partition-panel { margin-top: 12px; }
+#partition-slice-chart { width: 100%; height: 180px; background: #0d1326; border: 1px solid var(--line); border-radius: 8px; display: block; }
 
 /* Cards */
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 13px 14px; }

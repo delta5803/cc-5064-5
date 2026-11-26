@@ -8,7 +8,9 @@ import {
 } from '../core/assignment.js';
 import { createCamera, cameraMatrices } from '../core/camera.js';
 import { createNightMarketLights, createOverlapStressLights } from '../core/lights.js';
-import { runComparison } from '../core/reference.js';
+import { runComparison, sceneBoxes } from '../core/reference.js';
+import { computeAdaptiveBoundaries } from '../core/adaptive.js';
+import { comparePartitions } from '../core/experiment.js';
 
 export const MAX_LIGHTS = 256;
 export const RENDER_W = 1280;
@@ -53,6 +55,11 @@ export class LabStore {
     this.listeners = new Set();
     this.cam = createCamera();
     this.clusterSettings = { tilePixels: 80, slices: 24 };
+    // Depth partition scheme chosen from the UI: 'fixed' (exponential) or
+    // 'adaptive' (visible-depth quantiles). Both feed the same shader via the
+    // boundary table baked into every published frame's cfg.
+    this.partition = 'fixed';
+    this.adaptiveInfo = null;
     this.cfg = this._makeCfg();
     this.bounds = buildClusterBounds(this.cfg);
 
@@ -78,6 +85,8 @@ export class LabStore {
     this.lastError = null;
 
     this.comparison = null;
+    this.partitionComparison = null;
+    this.partitionRunning = false;
     this.comparisonRunning = false;
 
     this.recompute('init');
@@ -92,7 +101,23 @@ export class LabStore {
       near: this.cam.near,
       far: this.cam.far,
       fovyDeg: this.cam.fovyDeg,
+      partition: this.partition,
     });
+  }
+
+  // Recompute the adaptive depth table for the current camera. Only meaningful
+  // when partition === 'adaptive'; returns null otherwise (fixed table is baked
+  // into cfg already).
+  _refreshAdaptiveTable() {
+    if (this.partition !== 'adaptive') { this.adaptiveInfo = null; return; }
+    const mats = cameraMatrices(this.cam, this.cfg.aspect);
+    const info = computeAdaptiveBoundaries(this.cfg, mats, this.cam, sceneBoxes());
+    this.adaptiveInfo = info;
+    this.cfg = {
+      ...this.cfg,
+      boundaries: info.boundaries,
+    };
+    this.bounds = buildClusterBounds(this.cfg);
   }
 
   subscribe(fn) {
@@ -199,10 +224,25 @@ export class LabStore {
     this.clusterSettings[key] = Math.round(value);
     this.cfg = this._makeCfg();
     this.bounds = buildClusterBounds(this.cfg);
+    this._refreshAdaptiveTable();
     this.recompute('cluster-setting');
   }
 
+  setPartition(partition) {
+    const p = partition === 'adaptive' ? 'adaptive' : 'fixed';
+    if (p === this.partition) return;
+    this.partition = p;
+    this.cfg = this._makeCfg();
+    this.bounds = buildClusterBounds(this.cfg);
+    if (p === 'adaptive') this._refreshAdaptiveTable();
+    else this.adaptiveInfo = null;
+    this.recompute('partition');
+  }
+
   cameraChanged() {
+    this.cfg = this._makeCfg();
+    this.bounds = buildClusterBounds(this.cfg);
+    this._refreshAdaptiveTable();
     this.recompute('camera');
   }
 
@@ -211,12 +251,14 @@ export class LabStore {
   recompute(reason = 'recompute') {
     this.lastError = null;
     const t0 = now();
+    if (this.partition === 'adaptive') this._refreshAdaptiveTable();
     this.mats = cameraMatrices(this.cam, this.cfg.aspect);
     let candidate;
     try {
       candidate = assignClusters(this.cfg, this.bounds, this.mats.view, this.lights, this.options);
     } catch (e) {
       this.lastError = '分配内核异常: ' + (e && e.message ? e.message : String(e));
+      this.status = { level: 'bad', text: '分簇灯光异常：' + this.lastError };
       this.emit('error');
       return this.published;
     }
@@ -304,6 +346,34 @@ export class LabStore {
       this.emit('comparison-done');
     }
     return this.comparison;
+  }
+
+  // Fixed-vs-adaptive partition comparison on the CURRENT live light rig. Errors
+  // and leaks are surfaced via lastError / status so the UI can display them.
+  async runPartitionComparison() {
+    if (this.partitionRunning) return this.partitionComparison;
+    this.partitionRunning = true;
+    this.emit('partition-start');
+    await new Promise((r) => setTimeout(r, 20));
+    try {
+      this.partitionComparison = comparePartitions({
+        lights: this.lights,
+        cam: this.cam,
+        capacity: this.options.capacity,
+        globalBudget: this.options.globalBudget,
+        totalIndexBudget: this.options.totalIndexBudget,
+        strategy: this.options.strategy,
+        slices: this.clusterSettings.slices,
+      });
+      this.lastError = null;
+    } catch (e) {
+      this.lastError = '分区对比失败: ' + (e && e.message ? e.message : String(e));
+      this.status = { level: 'bad', text: this.lastError };
+    } finally {
+      this.partitionRunning = false;
+      this.emit('partition-done');
+    }
+    return this.partitionComparison;
   }
 
   // Headless / automation hook: run a drag path and audit every published frame.

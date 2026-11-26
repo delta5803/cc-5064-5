@@ -85,6 +85,17 @@ export function assignClusters(cfg, bounds, viewMatrix, lights, optsInput = {}) 
   const K = cfg.clusterCount;
   const N = lights.length;
 
+  // Per-cluster capacity. A function (used by the adaptive-column experiment)
+  // may raise capacity for the densest clusters; without one every cluster uses
+  // the flat `capacity`.
+  const capArr = new Uint32Array(K);
+  if (typeof opts.localCapacityFn === 'function') {
+    for (let id = 0; id < K; id++) capArr[id] = Math.max(1, opts.localCapacityFn(id) | 0);
+  } else {
+    capArr.fill(opts.capacity);
+  }
+  const capOf = (id) => capArr[id];
+
   const raw = Array.from({ length: K }, () => []);
   const rawCount = new Uint32Array(K);
   /** @type {{ids:number[], sliceCount:number, tileCount:number}[]} */
@@ -166,20 +177,22 @@ export function assignClusters(cfg, bounds, viewMatrix, lights, optsInput = {}) 
   let pendingClusterIds = [];
 
   const overCapacityClusters = [];
-  for (let id = 0; id < K; id++) if (rawCount[id] > opts.capacity) overCapacityClusters.push(id);
+  for (let id = 0; id < K; id++) if (rawCount[id] > capOf(id)) overCapacityClusters.push(id);
 
   if (opts.strategy === STRATEGY.GLOBAL) {
     if (globalSet.size > opts.globalBudget) {
       complete = false;
       reason = `宽灯/固定全局灯共 ${globalSet.size} 盏，超过全局灯预算 ${opts.globalBudget}`;
-      for (let id = 0; id < K; id++) if (localCount[id] > opts.capacity) pendingClusterIds.push(id);
+      for (let id = 0; id < K; id++) if (localCount[id] > capOf(id)) pendingClusterIds.push(id);
     }
     // Greedily promote the highest-footprint non-global light from any cluster
     // that is still over capacity. Highest footprint resolves the most pressure.
     while (complete) {
       let worst = -1;
+      let worstOver = 0;
       for (let id = 0; id < K; id++) {
-        if (localCount[id] > opts.capacity && (worst < 0 || localCount[id] > localCount[worst])) worst = id;
+        const over = localCount[id] - capOf(id);
+        if (over > 0 && (worst < 0 || over > worstOver)) { worst = id; worstOver = over; }
       }
       if (worst < 0) break;
       if (globalSet.size >= opts.globalBudget) {
@@ -200,12 +213,12 @@ export function assignClusters(cfg, bounds, viewMatrix, lights, optsInput = {}) 
       for (const id of footprints[pick].ids) localCount[id]--;
     }
     if (!complete) {
-      for (let id = 0; id < K; id++) if (localCount[id] > opts.capacity) pendingClusterIds.push(id);
+      for (let id = 0; id < K; id++) if (localCount[id] > capOf(id)) pendingClusterIds.push(id);
     }
   } else if (opts.strategy === STRATEGY.STRICT) {
     for (let id = 0; id < K; id++) {
       // Pinned globals are removed; any remaining over-capacity is a hard fail.
-      if (localCount[id] > opts.capacity) pendingClusterIds.push(id);
+      if (localCount[id] > capOf(id)) pendingClusterIds.push(id);
     }
     if (pendingClusterIds.length) {
       complete = false;
@@ -229,12 +242,13 @@ export function assignClusters(cfg, bounds, viewMatrix, lights, optsInput = {}) 
       if (globalSet.has(slot)) globalsHere.push(slot);
       else locals.push(slot);
     }
-    // Stable ordering: primary first up to capacity, then spill.
+    // Stable ordering: primary first up to this cluster's capacity, then spill.
     let primary;
     let spill;
     if (opts.strategy === STRATEGY.SPILL || opts.strategy === STRATEGY.HYBRID) {
-      primary = locals.slice(0, opts.capacity);
-      spill = locals.slice(opts.capacity);
+      const cap = capOf(id);
+      primary = locals.slice(0, cap);
+      spill = locals.slice(cap);
     } else {
       // global / strict: locals are guaranteed <= capacity when complete.
       primary = locals;
@@ -293,12 +307,15 @@ export function assignClusters(cfg, bounds, viewMatrix, lights, optsInput = {}) 
   rawSorted.sort((a, b) => a - b);
   const mean = rawTotal / K;
   const p95 = rawSorted[Math.min(K - 1, Math.floor(K * 0.95))] || 0;
+  let capTotal = 0;
+  for (let id = 0; id < K; id++) capTotal += capOf(id);
 
   const stats = {
     clusterCount: K,
     cols: cfg.cols,
     rows: cfg.rows,
     slices: cfg.slices,
+    partition: cfg.partition || 'fixed',
     lightCount: lights.length,
     onLights,
     intersectionTests,
@@ -322,8 +339,11 @@ export function assignClusters(cfg, bounds, viewMatrix, lights, optsInput = {}) 
     indexBytes: indexData.length * 4,
     headerBytes: K * 16,
     actualBufferBytes: indexData.length * 4 + K * 16,
-    // Theoretical worst-case bounded table memory.
+    // Theoretical worst-case bounded table memory (flat) vs the actual sum of
+    // per-cluster capacities when an adaptive column is in use.
     worstBoundedBytes: K * opts.capacity * 4 + K * 16 + opts.globalBudget * 4,
+    worstPerClusterCapBytes: capTotal * 4 + K * 16 + opts.globalBudget * 4,
+    capacitySum: capTotal,
     worstPureDuplicationBytes: rawTotal * 4 + K * 16,
     capacity: opts.capacity,
     globalBudget: opts.globalBudget,
@@ -350,6 +370,7 @@ export function assignClusters(cfg, bounds, viewMatrix, lights, optsInput = {}) 
     globalOffset,
     pendingClusterIds: [...new Set(pendingClusterIds)],
     overCapacityClusters,
+    capArr,
     stats,
   };
 }
@@ -372,6 +393,7 @@ export function checkFrameInvariants(frame, lights) {
   for (let id = 0; id < K; id++) {
     const offset = frame.headerData[id * 4];
     const count = frame.headerData[id * 4 + 1];
+    const cap = frame.capArr ? frame.capArr[id] : frame.opts.capacity;
     if (offset + count > frame.indexData.length) {
       violations.push(`cluster ${id} index range exceeds buffer`);
       continue;
@@ -385,12 +407,12 @@ export function checkFrameInvariants(frame, lights) {
       if (globalSet.has(slot)) violations.push(`cluster ${id} also contains global slot ${slot} (double use)`);
       seen.add(slot);
     }
-    if (frame.opts.strategy === STRATEGY.GLOBAL && frame.complete && count > frame.opts.capacity) {
+    if (frame.opts.strategy === STRATEGY.GLOBAL && frame.complete && count > cap) {
       violations.push(`complete global frame cluster ${id} exceeds capacity`);
     }
     const primary = frame.headerData[id * 4 + 2];
     if ((frame.opts.strategy === STRATEGY.SPILL || frame.opts.strategy === STRATEGY.HYBRID) &&
-        frame.complete && primary > frame.opts.capacity) {
+        frame.complete && primary > cap) {
       violations.push(`bounded primary list cluster ${id} exceeds capacity`);
     }
   }

@@ -251,7 +251,8 @@ function refreshStatus() {
   $('hud-assign-ms').textContent = fmt1(store.assignmentMs) + ' ms';
   $('hud-draws').textContent = renderer ? String(renderer.drawCalls) : 'GL 不可用';
   $('hud-strategy').textContent = store.options.strategy + ' · C=' + store.options.capacity +
-    ' · G=' + store.options.globalBudget;
+    ' · G=' + store.options.globalBudget +
+    ' · ' + (store.cfg.partition === 'adaptive' ? '自适应深度' : '固定深度');
 }
 
 // ------------------------------------------------------------- stats panel --
@@ -283,6 +284,9 @@ function refreshStats() {
     statCard('最大原始 / 已存', `${s.maxRawOccupancy} / ${s.maxStoredOccupancy}`, s.maxRawOccupancy > s.capacity ? 'warn' : ''),
     statCard('平均 / P95 原始', `${s.meanRawOccupancy.toFixed(1)} / ${s.p95RawOccupancy}`),
     statCard('索引槽 / 实际显存', `${fmtInt(s.indexSlots)} · ${fmtBytes(s.actualBufferBytes)}`),
+    statCard('深度分区', store.cfg.partition === 'adaptive'
+      ? `自适应 · 采样 ${fmtInt(store.adaptiveInfo?.sampleCount || 0)} 点`
+      : '固定指数切分', store.cfg.partition === 'adaptive' ? '' : 'ok'),
     statCard('主表硬上界 C×K', fmtBytes(s.worstBoundedBytes), 'ok'),
     statCard(`纯复制理论最坏 ${n}×K`, fmtBytes(pureWorstBytes), pureWorstBytes > s.worstBoundedBytes ? 'warn' : ''),
     statCard('漏光（覆盖缺失）', leak == null ? '运行对比测量' : fmtInt(leak), leak === 0 ? 'ok' : 'bad'),
@@ -389,8 +393,8 @@ function refreshInspector(force = false) {
   const pending = (store.pending?.pendingClusterIds || []).includes(id);
 
   $('cluster-info').textContent =
-    `cluster id=${id}  tile(x=${d.tx}, y=${d.ty} 左下原点)  slice=${d.s}\n` +
-    `视深区间 ${b0.toFixed(2)}m … ${b1.toFixed(2)}m（指数边界，非线性硬件深度逆投影后取片）\n` +
+    `cluster id=${id}  tile(x=${d.tx}, y=${d.ty} 左下原点)  slice=${d.s}  分区=${store.cfg.partition === 'adaptive' ? '自适应(可见深分位)' : '固定(指数)'}\n` +
+    `视深区间 ${b0.toFixed(2)}m … ${b1.toFixed(2)}m（${store.cfg.partition === 'adaptive' ? '可见深度分位数边界' : '指数边界'}，非线性硬件深度逆投影后取片）\n` +
     `原始候选=${raw}  容量C=${store.options.capacity}  ` +
     `主表=${view.primary}  溢出=${view.spill}  另加全局=${view.globals.length}\n` +
     `header(offset=${view.offset}, count=${view.count})` +
@@ -610,6 +614,11 @@ function bindControls() {
   $('debug-mode').addEventListener('change', (e) => {
     store.setDebugMode(e.target.value === 'lit' ? 'lit' : Number(e.target.value));
   });
+  $('partition-mode').addEventListener('change', (e) => {
+    store.setPartition(e.target.value);
+    overlay.pinnedId = null;
+    refreshInspector(true);
+  });
   $('slice-range').addEventListener('input', (e) => {
     overlay.inspectSlice = Number(e.target.value);
     $('slice-val').textContent = e.target.value;
@@ -648,6 +657,7 @@ function bindControls() {
 
   $('btn-compare').addEventListener('click', runComparisonAndRender);
   $('btn-compare-2').addEventListener('click', runComparisonAndRender);
+  $('btn-partition-compare').addEventListener('click', runPartitionComparisonAndRender);
 
   $('btn-help').addEventListener('click', () => $('help-modal').classList.remove('hidden'));
   $('help-close').addEventListener('click', () => $('help-modal').classList.add('hidden'));
@@ -666,6 +676,75 @@ function putPixels(canvas, rgba, w, h) {
   const img = ctx.createImageData(w, h);
   img.data.set(rgba);
   ctx.putImageData(img, 0, 0);
+}
+
+async function runPartitionComparisonAndRender() {
+  $('partition-status').textContent = '计算中（全灯参考 + 两种分区）…';
+  $('btn-partition-compare').disabled = true;
+  try {
+    const r = await store.runPartitionComparison();
+    if (!r) {
+      $('partition-status').textContent = store.lastError || '对照失败';
+      $('partition-metrics').textContent = store.lastError || '对照失败（详见状态栏）';
+      return;
+    }
+    putPixels($('pcf-fixed'), r.fixed.rgba, r.width, r.height);
+    putPixels($('pcf-adaptive'), r.adaptive.rgba, r.width, r.height);
+    putPixels($('pcf-diff'), r.diff, r.width, r.height);
+    drawPartitionSliceChart(r.fixed.perSlice, r.adaptive.perSlice);
+    const fmtM = (m) => `${Number.isFinite(m.psnr) ? m.psnr.toFixed(2) + ' dB' : '∞（与全灯参考一致）'}  ` +
+      `最大差 ${m.maxAbs}  差异像素 ${m.mismatchPixels}  漏光 ${m.coverageMissCount}`;
+    const line = (label, d) => `${label}：${fmtM(d.metrics)}\n` +
+      `    每像素灯数 均值 ${d.metrics.clusteredAvgPerPixel.toFixed(2)} 峰值 ${d.metrics.clusteredMaxPerPixel}  → 加速 ${d.metrics.speedup.toFixed(2)}×\n` +
+      `    索引槽 ${d.stats.indexSlots}（${fmtBytes(d.stats.actualBufferBytes)}）最大簇存 ${d.stats.maxStoredOccupancy} 全局宽灯 ${d.stats.globalCount}` +
+      (d.firstOverCapacity ? `\n    最先超容量簇 tile(${d.firstOverCapacity.tx},${d.firstOverCapacity.ty}) s${d.firstOverCapacity.slice} 原始 ${d.firstOverCapacity.rawCount}/${d.firstOverCapacity.capacity}` : '');
+    $('partition-metrics').textContent =
+      `当前灯群 ${store.lights.length} 盏 · 容量 C=${store.options.capacity} · 全局 G=${store.options.globalBudget}\n` +
+      line('固定', r.fixed) + '\n' + line('自适应', r.adaptive) +
+      `\n两分区逐像素差异 最大 ${r.partitionDiffMax} · 差异像素 ${r.partitionDiffPixels}（应接近 0：两者均对齐全灯参考）；` +
+      `索引 ${r.fixed.stats.indexSlots} vs ${r.adaptive.stats.indexSlots} 槽`;
+    const leaks = r.fixed.metrics.coverageMissCount + r.adaptive.metrics.coverageMissCount;
+    $('partition-status').textContent = leaks === 0
+      ? `完成：两分区均零漏光；索引 ${r.fixed.stats.indexSlots} vs ${r.adaptive.stats.indexSlots} 槽`
+      : `⚠ 检测到 ${leaks} 次漏光（不应发生）`;
+  } finally {
+    $('btn-partition-compare').disabled = false;
+  }
+}
+
+function drawPartitionSliceChart(fixedSlices, adaptiveSlices) {
+  const cv = $('partition-slice-chart');
+  if (!cv) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const W = cv.clientWidth || 640;
+  const H = 180;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const n = fixedSlices.length;
+  const padL = 34, padR = 10, padT = 12, padB = 22;
+  const maxV = Math.max(1, ...fixedSlices.map((s) => s.meanStored), ...adaptiveSlices.map((s) => s.meanStored));
+  const bw = (W - padL - padR) / n;
+  ctx.font = '9px ui-monospace, monospace';
+  ctx.textBaseline = 'top';
+  for (let s = 0; s < n; s++) {
+    const x = padL + s * bw;
+    const fh = (H - padT - padB) * (fixedSlices[s].meanStored / maxV);
+    const ah = (H - padT - padB) * (adaptiveSlices[s].meanStored / maxV);
+    ctx.fillStyle = '#3f8fd6';
+    ctx.fillRect(x + 1, H - padB - fh, bw * 0.45, fh);
+    ctx.fillStyle = '#ffd166';
+    ctx.fillRect(x + bw * 0.5, H - padB - ah, bw * 0.45, ah);
+    if (s % 4 === 0) {
+      ctx.fillStyle = '#8fa0d0';
+      ctx.fillText(String(s), x + 1, H - padB + 4);
+    }
+  }
+  ctx.fillStyle = '#3f8fd6'; ctx.fillText('固定', padL, 0);
+  ctx.fillStyle = '#ffd166'; ctx.fillText('自适应', padL + 40, 0);
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.beginPath(); ctx.moveTo(padL, H - padB + 0.5); ctx.lineTo(W - padR, H - padB + 0.5); ctx.stroke();
 }
 
 async function runComparisonAndRender() {
@@ -863,8 +942,15 @@ window.__clusterLab = {
   get renderer() { return renderer; },
   overlay,
   runComparison: runComparisonAndRender,
+  runPartitionComparison: runPartitionComparisonAndRender,
   playStory,
   budgetDrill,
+  setPartition(p) {
+    store.setPartition(p);
+    $('partition-mode').value = p;
+    overlay.pinnedId = null;
+    refreshInspector(true);
+  },
   pickClusterAtClient(clientX, clientY) {
     const r = canvas.getBoundingClientRect();
     pickClusterAt(((clientX - r.left) / r.width) * store.cfg.width,

@@ -53,8 +53,11 @@ async function main() {
       headless: true,
       protocolTimeout: 120000,
       env: (() => {
-        const extraLibs = ['/tmp/chromelibs/usr/lib/aarch64-linux-gnu', '/tmp/chromelibs/lib/aarch64-linux-gnu']
-          .filter((p) => existsSync(p));
+        const extraLibs = [
+          '/tmp/chromelibs/lib',
+          '/tmp/chromelibs/usr/lib/aarch64-linux-gnu',
+          '/tmp/chromelibs/lib/aarch64-linux-gnu',
+        ].filter((p) => existsSync(p));
         if (!extraLibs.length) return process.env;
         return { ...process.env, LD_LIBRARY_PATH: [...extraLibs, process.env.LD_LIBRARY_PATH || ''].join(':') };
       })(),
@@ -307,6 +310,104 @@ async function main() {
     if (!/完全一致|PSNR/.test(metrics)) hardErrors.push('comparison did not produce metrics');
     const cmpPanel = await page.$('.compare-panel');
     await cmpPanel.screenshot({ path: path.join(OUT, 'ui-12-compare.png') });
+
+    // ---- Depth partition: fixed vs adaptive through the same shader -------
+    console.log('→ adaptive partition + live comparison');
+    // Switch the live kernel to adaptive; it must still publish a complete frame.
+    await page.select('#partition-mode', 'adaptive');
+    await sleep(500);
+    const adaptiveState = await page.evaluate(() => {
+      const s = window.__store;
+      const f = s.published;
+      return {
+        partition: s.partition,
+        cfgPartition: s.cfg.partition,
+        boundaries: Array.from(s.cfg.boundaries).slice(0, 4).map((v) => +v.toFixed(2)),
+        hasInfo: !!s.adaptiveInfo && s.adaptiveInfo.sampleCount > 0,
+        version: s.version,
+        pending: !!s.pending,
+        hud: document.querySelector('#hud-strategy').textContent,
+      };
+    });
+    console.log('adaptive:', JSON.stringify(adaptiveState));
+    if (adaptiveState.cfgPartition !== 'adaptive') hardErrors.push('adaptive partition not applied to cfg');
+    if (!adaptiveState.hasInfo) hardErrors.push('adaptive depth sampling produced no samples');
+    if (adaptiveState.pending) hardErrors.push('adaptive partition failed to publish a complete frame');
+    await stage.screenshot({ path: path.join(OUT, 'ui-15-adaptive-stage.png') });
+
+    // Cluster inspector must reflect the adaptive partitioning scheme.
+    await page.evaluate(() => {
+      const c = document.querySelector('#overlay').getBoundingClientRect();
+      window.__clusterLab.pickClusterAtClient(c.left + c.width * 0.5, c.top + c.height * 0.8);
+    });
+    await sleep(350);
+    const adaptiveInspector = await page.$eval('#cluster-info', (e) => e.textContent);
+    if (!/分区=自适应/.test(adaptiveInspector)) hardErrors.push('inspector did not report adaptive partition');
+
+    // Run the live fixed-vs-adaptive comparison panel (same kernel + shading).
+    await page.evaluate(() => document.querySelector('#partition-panel')?.scrollIntoView({ block: 'start' }));
+    await page.click('#btn-partition-compare');
+    await page.waitForFunction(() => {
+      const t = document.querySelector('#partition-status')?.textContent || '';
+      return /完成|失败|漏光/.test(t);
+    }, { timeout: 60000 });
+    await sleep(300);
+    const partitionState = await page.evaluate(() => {
+      const pm = document.querySelector('#partition-metrics')?.textContent || '';
+      const ps = document.querySelector('#partition-status')?.textContent || '';
+      // Are the comparison canvases actually painted (non-uniform)?
+      const sample = (id) => {
+        const cv = document.getElementById(id);
+        const ctx = cv.getContext('2d');
+        const d = ctx.getImageData(0, 0, cv.width, cv.height).data;
+        let sum = 0, sum2 = 0, n = 0;
+        for (let i = 0; i < d.length; i += 4 * 137) { sum += d[i]; sum2 += d[i] * d[i]; n++; }
+        const mean = sum / n;
+        return { mean, variance: sum2 / n - mean * mean };
+      };
+      return {
+        status: ps, metrics: pm.slice(0, 400),
+        fixed: sample('pcf-fixed'), adaptive: sample('pcf-adaptive'), diff: sample('pcf-diff'),
+        error: window.__store.lastError || '',
+      };
+    });
+    console.log('partition:', JSON.stringify(partitionState));
+    if (!/完成/.test(partitionState.status)) hardErrors.push('partition comparison did not report success: ' + partitionState.status);
+    if (/检测到/.test(partitionState.status)) hardErrors.push('partition comparison reported light leakage: ' + partitionState.status);
+    if (partitionState.fixed.variance < 4) hardErrors.push('fixed partition image looks blank');
+    if (partitionState.adaptive.variance < 4) hardErrors.push('adaptive partition image looks blank');
+    if (!/固定|自适应/.test(partitionState.metrics)) hardErrors.push('partition metrics did not list both schemes');
+    if (partitionState.error) hardErrors.push('partition comparison error: ' + partitionState.error);
+    await page.screenshot({ path: path.join(OUT, 'ui-16-partition-compare.png') });
+
+    // Move a light while in adaptive mode: the lit image and per-cluster light
+    // list must both come from the real recomputed kernel.
+    const adaptiveDrag = await page.evaluate(async () => {
+      const lab = window.__clusterLab;
+      const uid = window.__store.selectedUid;
+      const before = lab.handleClientXY(uid);
+      const l0 = window.__store.lights.find((q) => q.uid === uid);
+      if (!before || !l0) return { skipped: true };
+      const v0 = window.__store.version;
+      lab.store.patchLight(uid, { pos: [l0.pos[0] + 1.5, l0.pos[1], l0.pos[2] - 1.5] }, 'shot-adaptive-move');
+      await new Promise((r) => setTimeout(r, 120));
+      const f = window.__store.published;
+      return {
+        skipped: false, v0, v1: f.version, partition: f.cfg.partition,
+        pending: !!window.__store.pending,
+        boundaries: Array.from(f.cfg.boundaries).slice(0, 3).map((x) => +x.toFixed(2)),
+      };
+    });
+    console.log('adaptive move:', JSON.stringify(adaptiveDrag));
+    if (!adaptiveDrag.skipped) {
+      if (adaptiveDrag.v1 <= adaptiveDrag.v0) hardErrors.push('adaptive light move did not publish a new frame');
+      if (adaptiveDrag.pending) hardErrors.push('adaptive light move left the frame pending');
+      if (adaptiveDrag.partition !== 'adaptive') hardErrors.push('adaptive move republished under the wrong partition');
+    }
+
+    // Restore the fixed partition for the remaining checks.
+    await page.select('#partition-mode', 'fixed');
+    await sleep(300);
 
     // ---- Help modal -------------------------------------------------------
     await page.click('#btn-help');

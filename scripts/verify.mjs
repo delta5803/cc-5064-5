@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 import { createNightMarketLights, createOverlapStressLights } from '../src/core/lights.js';
 import { createCamera, orbit, cameraMatrices } from '../src/core/camera.js';
-import { runComparison } from '../src/core/reference.js';
+import { runComparison, sceneBoxes } from '../src/core/reference.js';
 import { assignClusters, checkFrameInvariants } from '../src/core/assignment.js';
 import {
   makeClusterConfig, buildClusterBounds, depth01ToViewDepth,
@@ -17,6 +17,10 @@ import { LabStore } from '../src/app/store.js';
 import { projectWorld, vec3 } from '../src/core/math.js';
 import { contributionsAtPoint } from '../src/core/shading.js';
 import { encodePNG } from './png.mjs';
+import { computeAdaptiveBoundaries } from '../src/core/adaptive.js';
+import {
+  buildUniformLights, buildNearKnotLights, runOne, comparePartitions, measureTruncationError,
+} from '../src/core/experiment.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUT = path.join(__dirname, '..', 'artifacts');
@@ -231,8 +235,81 @@ console.log('\n== Per-light toggle attributes a bright source ==');
   store.toggleLight(stall.uid, true);
 }
 
-console.log('\n== Giant global entry vs cluster duplication / worst memory ==');
+console.log('\n== Depth partition: fixed vs visible-depth-adaptive ==');
 {
+  // Boundary table is shared with the shader; both schemes must round-trip through
+  // sliceForViewDepth consistently and be strictly increasing.
+  const baseCfg = makeClusterConfig({ partition: 'fixed' });
+  check('fixed table equals exponential boundaries', (() => {
+    for (let k = 0; k <= baseCfg.slices; k++) {
+      const e = baseCfg.near * Math.pow(baseCfg.far / baseCfg.near, k / baseCfg.slices);
+      if (Math.abs(baseCfg.boundaries[k] - e) > 1e-3 * Math.max(1, Math.abs(e))) return false;
+    }
+    return true;
+  })());
+  const mono = (b) => { for (let k = 1; k < b.length; k++) if (!(b[k] > b[k - 1])) return false; return true; };
+  check('fixed boundaries strictly increasing', mono(baseCfg.boundaries));
+
+  const cam = createCamera();
+  const mats = cameraMatrices(cam, baseCfg.aspect);
+  const adaptCfg = makeClusterConfig({ partition: 'adaptive' });
+  const info = computeAdaptiveBoundaries(adaptCfg, mats, cam, sceneBoxes());
+  adaptCfg.boundaries = info.boundaries;
+  check('adaptive boundaries strictly increasing', mono(info.boundaries));
+  check('adaptive samples real visible depths', info.sampleCount > 1000, `samples=${info.sampleCount}`);
+  check('adaptive redistributes slices (boundaries differ from fixed)', (() => {
+    let maxRel = 0;
+    for (let k = 1; k < baseCfg.slices; k++) {
+      maxRel = Math.max(maxRel, Math.abs(info.boundaries[k] - baseCfg.boundaries[k]) / baseCfg.boundaries[k]);
+    }
+    return maxRel > 0.1;
+  })(), `adaptiveNearQuarterSlices=${info.nearQuarterSlices}`);
+
+  // Slice mapping agrees between the table lookup and a brute-force scan.
+  let sliceMismatch = 0;
+  for (let i = 0; i <= 2000; i++) {
+    const d = baseCfg.near * Math.pow(baseCfg.far / baseCfg.near, i / 2000);
+    let brute = 0;
+    for (let k = 0; k < baseCfg.slices; k++) if (d >= baseCfg.boundaries[k]) brute = k;
+    if (sliceForViewDepth(baseCfg, d) !== brute) sliceMismatch++;
+  }
+  check('sliceForViewDepth table lookup matches brute-force boundary scan', sliceMismatch === 0, `mismatch=${sliceMismatch}`);
+
+  // Both partitions through the SAME kernel + shading, zero leak, zero error.
+  const uniform = buildUniformLights(96);
+  const knot = buildNearKnotLights(96);
+  const uFixed = runOne({ lights: uniform, cam, partition: 'fixed', capacity: 16, globalBudget: 32 });
+  const uAdapt = runOne({ lights: uniform, cam, partition: 'adaptive', capacity: 16, globalBudget: 32 });
+  for (const [name, r] of [['uniform/fixed', uFixed], ['uniform/adaptive', uAdapt]]) {
+    check(`${name} complete + zero leak`, r.complete && r.metrics.coverageMissCount === 0, `miss=${r.metrics.coverageMissCount}`);
+    check(`${name} matches all-light reference`, r.metrics.psnr >= 40, `PSNR=${r.metrics.psnr}`);
+  }
+  const kFixed = runOne({ lights: knot, cam, partition: 'fixed', capacity: 16, globalBudget: 32 });
+  const kAdapt = runOne({ lights: knot, cam, partition: 'adaptive', capacity: 16, globalBudget: 32 });
+  for (const [name, r] of [['knot/fixed', kFixed], ['knot/adaptive', kAdapt]]) {
+    check(`${name} complete + zero leak`, r.complete && r.metrics.coverageMissCount === 0, `miss=${r.metrics.coverageMissCount}`);
+    check(`${name} matches all-light reference`, r.metrics.psnr >= 40, `PSNR=${r.metrics.psnr}`);
+  }
+  console.log(`  uniform  index slots: fixed=${uFixed.stats.indexSlots} adaptive=${uAdapt.stats.indexSlots} ` +
+    `| overCap fixed=${uFixed.stats.overCapacityClusterCount} adaptive=${uAdapt.stats.overCapacityClusterCount}`);
+  console.log(`  knot     index slots: fixed=${kFixed.stats.indexSlots} adaptive=${kAdapt.stats.indexSlots} ` +
+    `| overCap fixed=${kFixed.stats.overCapacityClusterCount} adaptive=${kAdapt.stats.overCapacityClusterCount}`);
+
+  // The two partitions must be reported on the SAME reference and refuse leaks.
+  const live = comparePartitions({
+    lights: knot, cam, capacity: 16, globalBudget: 32, slices: 24,
+  });
+  check('live partition comparison: both zero leak', live.fixed.metrics.coverageMissCount === 0 && live.adaptive.metrics.coverageMissCount === 0);
+  check('live partition comparison produced both images + diff', live.fixed.rgba.length === live.width * live.height * 4 && live.diff.length === live.fixed.rgba.length);
+
+  // Negative control must show real error; proves the accepted runs are not
+  // "winning" by dropping lights.
+  const tr = measureTruncationError({ lights: knot, cam, partition: 'fixed', capacity: 16, globalBudget: 32 });
+  check('truncation control leaks and is far from reference (not the accepted path)', tr.coverageMissCount > 0 && tr.psnr < 40,
+    `miss=${tr.coverageMissCount} PSNR=${tr.psnr.toFixed(2)}`);
+}
+
+console.log('\n== Giant global entry vs cluster duplication / worst memory ==');{
   const cfg = makeClusterConfig({});
   const lights = createNightMarketLights(128);
   const cam = createCamera();

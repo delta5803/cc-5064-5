@@ -13,7 +13,7 @@
       <span class="logo">🏮</span>
       <div>
         <h1>夜市 · 密集灯光分簇前向渲染器</h1>
-        <p class="sub">屏幕瓦片 × 指数深度簇 · 保守求交 · 全局宽灯表 / 有界簇 + 溢出 · 完整帧发布</p>
+        <p class="sub">屏幕瓦片 × 深度簇（固定指数 / 可见深度自适应，同一着色器） · 保守求交 · 全局宽灯表 / 有界簇 + 溢出 · 完整帧发布</p>
       </div>
     </div>
     <div class="top-actions">
@@ -91,6 +91,22 @@
         </div>
         <div id="compare-metrics" class="metrics">尚未运行。点击“运行对比”以核对图像一致性、漏光与计算次数/加速比。</div>
       </div>
+
+      <div class="compare-panel partition-panel" id="partition-panel">
+        <div class="compare-head">
+          <h2>深度分区方案对照 · 固定 vs 随可见深度自适应（同一着色器）</h2>
+          <button id="btn-partition-compare" class="btn small">运行分区对照</button>
+          <span id="partition-status" class="compare-status"></span>
+        </div>
+        <div class="compare-canvases">
+          <figure><canvas id="pcf-fixed" width="320" height="180"></canvas><figcaption>固定指数分区 · 分簇光照</figcaption></figure>
+          <figure><canvas id="pcf-adaptive" width="320" height="180"></canvas><figcaption>可见深度自适应 · 分簇光照</figcaption></figure>
+          <figure><canvas id="pcf-diff" width="320" height="180"></canvas><figcaption>两分区逐像素差异 ×6（均对齐全灯参考，故通常全黑）</figcaption></figure>
+        </div>
+        <div id="partition-metrics" class="metrics">用当前灯群与相机运行对照。所有运行都对齐全灯参考，漏光>0 会被拒绝并在此报错。</div>
+        <h3 class="subhead">每深度片列表长度（固定 / 自适应 均值）</h3>
+        <canvas id="partition-slice-chart" width="640" height="180"></canvas>
+      </div>
     </section>
 
     <!-- ================= RIGHT: CONTROLS / INSPECTOR ================= -->
@@ -133,6 +149,13 @@
       <section class="card">
         <h2>分簇与预算 / 溢出策略</h2>
         <div class="row">
+          <label>深度分区方案</label>
+          <select id="partition-mode">
+            <option value="fixed" selected>固定指数切分（固定深度桶）</option>
+            <option value="adaptive">随可见深度自适应（分位数边界）</option>
+          </select>
+        </div>
+        <div class="row">
           <label>溢出策略</label>
           <select id="strategy">
             <option value="hybrid" selected>混合（推荐）：宽灯入全局 + 有界簇/溢出表</option>
@@ -147,7 +170,7 @@
         <div class="row"><label>瓦片像素 <span id="tile-val">80</span></label><input type="range" id="tile-range" min="32" max="160" step="16" value="80" /></div>
         <div class="row"><label>深度切片数 <span id="slices-val">24</span></label><input type="range" id="slices-range" min="8" max="40" step="1" value="24" /></div>
         <div class="row"><label>宽灯簇阈值 <span id="wide-val">1600</span></label><input type="range" id="wide-range" min="100" max="2600" step="50" value="1600" /></div>
-        <p class="tip">约定：视空间朝 −Z，线性视深 d=−z；先由非线性 gl_FragCoord.z 逆投影恢复 d，再用指数公式取片，绝不用深度值直接乘片数。</p>
+        <p class="tip">约定：视空间朝 −Z，线性视深 d=−z；先由非线性 gl_FragCoord.z 逆投影恢复 d，再用当前分区边界表取片，绝不用深度值直接乘片数。两种分区共用同一着色器，只替换这张边界表。</p>
       </section>
 
       <section class="card" id="stats-card">
@@ -179,9 +202,11 @@
     <div class="modal-box">
       <h2>如何启动 / 操作说明</h2>
       <div id="help-body">
-        <p><strong>启动界面：</strong>在 <code>/workspace</code> 运行 <code>npm start</code>（等价 <code>node serve.mjs</code>），浏览器打开终端打印的 <code>http://localhost:5180/</code>。也可用 <code>python3 -m http.server 5180</code> 后访问。必须经 http 打开（ES 模块限制）。</p>
-        <p><strong>无界面校验：</strong><code>npm run verify</code> 运行同一分簇内核的漏光/参考图一致性、预算状态机与拖动防混版本测试，并在 <code>artifacts/</code> 输出对比 PNG。</p>
+        <p><strong>启动界面：</strong>在 <code>/workspace</code> 运行 <code>npm start</code>（等价 <code>node serve.mjs</code>），浏览器打开终端打印的 <code>http://localhost:5180/</code>。也可用 <code>python3 -m http.server 5180</code> 后访问。必须经 http 打开（ES 模块限制）。<strong>图形入口以视口与右栏面板为准，命令行仅作辅助。</strong></p>
+        <p><strong>无界面校验（辅助）：</strong><code>npm run verify</code> 运行同一分簇内核的漏光/参考图一致性、预算状态机与拖动防混版本测试；<code>npm run experiment</code> 复算「固定 vs 自适应深度分区」的光照误差与列表量，写入 <code>artifacts/cluster-experiment.*</code>。</p>
         <ul>
+          <li><strong>深度分区方案</strong>下拉可在「固定指数切分」与「随可见深度自适应」间实时切换；两者共用同一着色器，只替换深度边界表。</li>
+          <li><strong>「深度分区方案对照」</strong>按钮一次渲染固定与自适应两幅分簇光照图、差异图，并列出两方案的 PSNR / 漏光 / 每像素灯数 / 索引槽 / 最先超容量簇与每深度片列表长度。</li>
           <li>拖动彩色灯手柄即可实时拖灯预览；内核每次生成不可变完整帧并整体上传。</li>
           <li>“复现”会关闭整排街灯并把横街巨灯拉到近裁面附近，观察某簇原始候选超过容量后如何被全局表/溢出表完整容纳。</li>
           <li>把策略切到“固定容量”或调小预算，可看到：不截断、不暗区，而是保留上个完整帧并以斜纹显示“待算区域”。</li>
